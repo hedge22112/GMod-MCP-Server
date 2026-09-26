@@ -48,6 +48,7 @@ public sealed class BridgePinger
             string? bootstrapError = null;
             string? bootstrapMapMissing = null;
             bool? hasFocus = null;
+            bool? dedicated = null;
             int? generation = null;
             IReadOnlyDictionary<string, bool>? capabilities = null;
             if (resp.Result is JsonObject obj)
@@ -123,6 +124,14 @@ public sealed class BridgePinger
                     hasFocus = hfBool;
                 }
 
+                // Server realm only; absent on older addons -> null (treated as not dedicated).
+                if (obj.TryGetPropertyValue("dedicated", out var dedNode)
+                    && dedNode is JsonValue dedVal
+                    && dedVal.TryGetValue<bool>(out var dedBool))
+                {
+                    dedicated = dedBool;
+                }
+
                 // Live capability convar values (id -> granted bool), so host_status can
                 // report the current grant state instead of the manifest snapshot.
                 if (obj.TryGetPropertyValue("capabilities", out var capNode) && capNode is JsonObject capObj)
@@ -139,7 +148,7 @@ public sealed class BridgePinger
                 }
             }
 
-            return new BridgePingResult(true, sw.Elapsed.TotalMilliseconds, enabled, map, bootstrapPending, maxPlayers, singlePlayer, bootstrapError, hasFocus, generation, capabilities, bootstrapMapMissing);
+            return new BridgePingResult(true, sw.Elapsed.TotalMilliseconds, enabled, map, bootstrapPending, maxPlayers, singlePlayer, bootstrapError, hasFocus, generation, capabilities, bootstrapMapMissing, dedicated);
         }
         catch (TaskCanceledException)
         {
@@ -160,7 +169,9 @@ public sealed class BridgePinger
     /// <c>bootstrap_pending</c>, so the naive ready check would otherwise treat a
     /// failed transition as success. The client realm only carries meaningful
     /// <c>reachable</c>/<c>enabled</c> (bootstrap state is server-side), so the shared
-    /// predicate handles both. Shared by <c>host_launch</c> and <c>host_changelevel</c>.
+    /// predicate handles both. A dedicated server has no client realm to wait for (nobody
+    /// hosts it locally), so once the server reports <c>dedicated</c> only the server counts
+    /// and the client isn't pinged. Shared by <c>host_launch</c> and <c>host_changelevel</c>.
     /// </summary>
     public async Task<(bool Ready, BridgePingResult Server, BridgePingResult Client, TimeSpan Elapsed)> WaitUntilReadyAsync(
         TimeSpan timeout, TimeSpan pollInterval, CancellationToken ct)
@@ -172,14 +183,17 @@ public sealed class BridgePinger
         {
             ct.ThrowIfCancellationRequested();
             server = await PingAsync("server", DefaultTimeout, ct).ConfigureAwait(false);
-            client = await PingAsync("client", DefaultTimeout, ct).ConfigureAwait(false);
+            var needClient = server.Dedicated != true;
+            client = needClient
+                ? await PingAsync("client", DefaultTimeout, ct).ConfigureAwait(false)
+                : default;
 
             if (server.BootstrapError != null || client.BootstrapError != null)
             {
                 sw.Stop();
                 return (false, server, client, sw.Elapsed);
             }
-            if (IsReady(server) && IsReady(client))
+            if (IsReady(server) && (!needClient || IsReady(client)))
             {
                 sw.Stop();
                 return (true, server, client, sw.Elapsed);
@@ -208,4 +222,5 @@ public readonly record struct BridgePingResult(
     bool? HasFocus,
     int? Generation,
     IReadOnlyDictionary<string, bool>? Capabilities,
-    string? BootstrapMapMissing = null);
+    string? BootstrapMapMissing = null,
+    bool? Dedicated = null);

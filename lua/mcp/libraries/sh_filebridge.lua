@@ -92,6 +92,9 @@ local function processOne(filename)
             -- caller a relaunch is needed to switch modes.
             maxplayers = game.MaxPlayers(),
             singleplayer = game.SinglePlayer(),
+            -- A dedicated server has no client realm behind the bridge, so the host's
+            -- readiness waits stop expecting one. Server realm only.
+            dedicated = SERVER and game.IsDedicated() or nil,
             -- Bumped by MCP:Reload; the mcp_reload host tool watches this advance to
             -- confirm the reload finished (the reload's own response gets eaten when
             -- StartBridge clears the IPC dirs).

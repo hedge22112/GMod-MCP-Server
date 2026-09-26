@@ -17,6 +17,7 @@ public sealed class LaunchTool : IHostTool
     private readonly BridgePinger _pinger;
     private readonly EngineLog _engineLog;
     private readonly string _mcpRoot;
+    private readonly BridgePaths _paths;
 
     public LaunchTool(GameProcessManager proc, BridgePinger pinger, EngineLog engineLog, BridgePaths paths)
     {
@@ -24,6 +25,7 @@ public sealed class LaunchTool : IHostTool
         _pinger = pinger;
         _engineLog = engineLog;
         _mcpRoot = paths.McpRoot;
+        _paths = paths;
     }
 
     public string Name => "host_launch";
@@ -64,6 +66,11 @@ public sealed class LaunchTool : IHostTool
 
     public async ValueTask<CallToolResult> InvokeAsync(IDictionary<string, JsonElement>? args, CancellationToken ct)
     {
+        if (_paths.Remote is { } remote)
+        {
+            return HostToolHelpers.RemoteUnsupported(Name, remote);
+        }
+
         var map = HostToolHelpers.GetString(args, "map", "gm_construct");
         var gamemode = HostToolHelpers.GetString(args, "gamemode", "sandbox");
         var console = HostToolHelpers.GetBool(args, "console", true);

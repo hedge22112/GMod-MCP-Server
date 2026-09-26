@@ -24,22 +24,25 @@ public sealed class EngineLog
         "(map change detected - the new map's startup console is suppressed here; read it with engine_log)";
 
     private readonly EngineLogReader _reader;
-    private readonly string _path;
+    private readonly ILogFile _file;
     private readonly object _gate = new();
     private long _passiveCursor = -1; // -1 = start-at-now on the next drain
     private long _anchorOffset = -1;  // where the current map's boot begins (set by Anchor), for ScanBoot
 
     public EngineLog(BridgePaths paths)
     {
-        _path = ResolvePath(paths.DataPath);
-        _reader = new EngineLogReader(_path);
+        // console.log lives in the mod dir, one level above data/.
+        _file = paths.Remote is { } remote
+            ? new RemoteLogFile(remote, "../" + LogFileName)
+            : new LocalLogFile(ResolvePath(paths.DataPath));
+        _reader = new EngineLogReader(_file);
     }
 
-    public string Path => _path;
+    public string Path => _file.DisplayPath;
 
-    public bool Present => File.Exists(_path);
+    public bool Present => _file.Stat() is not null;
 
-    public DateTime? LastWriteUtc => File.Exists(_path) ? File.GetLastWriteTimeUtc(_path) : null;
+    public DateTime? LastWriteUtc => _file.Stat()?.LastWriteUtc;
 
     /// <summary>
     /// Mark a new-map boundary (a game launch or an in-game level change): reset the unified
@@ -186,7 +189,7 @@ public sealed class EngineLog
                     lines = lines.Skip(lines.Count - limit).ToList();
                     dropped = true;
                 }
-                return new EngineLogReadResult(lines, cursor, dropped, File.Exists(_path), _path);
+                return new EngineLogReadResult(lines, cursor, dropped, _reader.Exists, _file.DisplayPath);
             }
 
             // Group first so a match pulls its WHOLE message (header + frames), never a fragment;
@@ -196,7 +199,7 @@ public sealed class EngineLog
                 .ToList();
             var selected = TakeRecentWithinLineBudget(matched, limit, ref dropped);
             var outLines = selected.SelectMany(m => m.Text.Split('\n')).ToList();
-            return new EngineLogReadResult(outLines, cursor, dropped, File.Exists(_path), _path);
+            return new EngineLogReadResult(outLines, cursor, dropped, _reader.Exists, _file.DisplayPath);
         }
     }
 

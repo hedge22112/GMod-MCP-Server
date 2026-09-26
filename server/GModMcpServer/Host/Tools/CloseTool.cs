@@ -7,8 +7,13 @@ namespace GModMcpServer.Host.Tools;
 public sealed class CloseTool : IHostTool
 {
     private readonly GameProcessManager _proc;
+    private readonly BridgePaths _paths;
 
-    public CloseTool(GameProcessManager proc) { _proc = proc; }
+    public CloseTool(GameProcessManager proc, BridgePaths paths)
+    {
+        _proc = proc;
+        _paths = paths;
+    }
 
     public string Name => "host_close";
 
@@ -33,6 +38,11 @@ public sealed class CloseTool : IHostTool
 
     public ValueTask<CallToolResult> InvokeAsync(IDictionary<string, JsonElement>? args, CancellationToken ct)
     {
+        if (_paths.Remote is { } remote)
+        {
+            return ValueTask.FromResult(HostToolHelpers.RemoteUnsupported(Name, remote));
+        }
+
         var force = HostToolHelpers.GetBool(args, "force", false);
         var seconds = 10.0;
         if (args is not null && args.TryGetValue("graceful_seconds", out var v)

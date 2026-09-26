@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using GModMcpServer.Bridge;
 using GModMcpServer.Host;
+using GModMcpServer.Remote;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -48,21 +49,40 @@ internal static class Program
         builder.Logging.AddConsole(opts => opts.LogToStandardErrorThreshold = LogLevel.Trace);
         builder.Logging.SetMinimumLevel(LogLevel.Information);
 
-        var dataPath = ResolveDataPath(builder.Configuration);
-        var mcpRoot = Path.Combine(dataPath, "mcp");
-        var gameRoot = ResolveGameRoot(dataPath);
-        Directory.CreateDirectory(mcpRoot);
-
         // Per-process session id so multiple .NET hosts sharing the same GMod
         // data dir don't read each other's request/response files.
         var sessionId = Guid.NewGuid().ToString("N");
 
-        builder.Services.AddSingleton(new BridgePaths(mcpRoot, sessionId, dataPath));
+        // --ssh points the bridge at a remote server's garrysmod/data instead of a local
+        // install; --data-path is then the remote path. Everything else is unchanged.
+        var sshSpec = builder.Configuration["ssh"] ?? builder.Configuration["SSH"];
+        SshAgent? remote = null;
+        string dataPath, mcpRoot, gameRoot;
+        if (!string.IsNullOrWhiteSpace(sshSpec))
+        {
+            var target = SshTarget.Parse(sshSpec, builder.Configuration["data-path"] ?? builder.Configuration["GMOD_DATA"]);
+            var agentLog = LoggerFactory.Create(b => b.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace));
+            remote = new SshAgent(target, builder.Configuration["ssh-exe"] ?? "ssh", agentLog.CreateLogger<SshAgent>());
+            dataPath = mcpRoot = gameRoot = "";
+        }
+        else
+        {
+            dataPath = ResolveDataPath(builder.Configuration);
+            mcpRoot = Path.Combine(dataPath, "mcp");
+            gameRoot = ResolveGameRoot(dataPath);
+            Directory.CreateDirectory(mcpRoot);
+        }
+
+        builder.Services.AddSingleton(new BridgePaths(mcpRoot, sessionId, dataPath, remote));
         builder.Services.AddSingleton<EngineLog>();
         builder.Services.AddSingleton<ManifestWatcher>(sp =>
-            new ManifestWatcher(mcpRoot, sp.GetRequiredService<ILoggerFactory>().CreateLogger<ManifestWatcher>()));
-        builder.Services.AddSingleton<FileBridgeRegistry>(sp =>
-            new FileBridgeRegistry(mcpRoot, sessionId, sp.GetRequiredService<ILoggerFactory>()));
+        {
+            var log = sp.GetRequiredService<ILoggerFactory>().CreateLogger<ManifestWatcher>();
+            return remote is null ? new ManifestWatcher(mcpRoot, log) : new ManifestWatcher(remote, log);
+        });
+        builder.Services.AddSingleton<FileBridgeRegistry>(sp => remote is null
+            ? new FileBridgeRegistry(mcpRoot, sessionId, sp.GetRequiredService<ILoggerFactory>())
+            : FileBridgeRegistry.ForRemote(remote, sessionId));
         builder.Services.AddSingleton<BridgePinger>();
 
         builder.Services.AddSingleton<GameProcessManager>(sp =>
@@ -82,7 +102,27 @@ internal static class Program
         builder.Services.AddHostedService<BridgeHostedService>();
 
         var host = builder.Build();
-        await host.RunAsync().ConfigureAwait(false);
+
+        if (remote is not null)
+        {
+            // Give the session a moment to come up so the client's first tools/list sees
+            // the game's tools; if it doesn't, list_changed catches up once it connects.
+            remote.Start();
+            var watcher = host.Services.GetRequiredService<ManifestWatcher>();
+            if (await remote.WaitFirstAttemptAsync(TimeSpan.FromSeconds(15), CancellationToken.None).ConfigureAwait(false))
+            {
+                await watcher.WaitForInitialAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+            }
+        }
+
+        try
+        {
+            await host.RunAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            remote?.Dispose();
+        }
         return 0;
     }
 
@@ -280,9 +320,11 @@ internal static class Program
                 && okVal.TryGetValue<bool>(out var okBool)
                 && okBool;
 
+            var content = BuildContent(resp.Result, resultJson, paths.DataPath);
+            if (paths.Remote is { } remote) AppendRemotePath(content, resp.Result, remote);
             var result = new CallToolResult
             {
-                Content = BuildContent(resp.Result, resultJson, paths.DataPath),
+                Content = content,
                 IsError = !ok,
             };
             return (result, jobEvents);
@@ -431,6 +473,7 @@ internal static class Program
     /// </summary>
     private static void AppendAbsolutePath(List<ContentBlock> blocks, JsonNode? result, string dataPath)
     {
+        if (string.IsNullOrEmpty(dataPath)) return; // remote: AppendRemotePath covers it
         if (result is not JsonObject obj) return;
         if (!obj.TryGetPropertyValue("path", out var node)) return;
         if (node is not JsonValue val || !val.TryGetValue<string>(out var rel) || string.IsNullOrEmpty(rel)) return;
@@ -449,24 +492,52 @@ internal static class Program
         if (!abs.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return;
         blocks.Add(new TextContentBlock { Text = "Saved to " + abs });
     }
+
+    /// <summary>
+    /// The remote form of <see cref="AppendAbsolutePath"/>: the file is on the server, so
+    /// name it as <c>host:/path</c> (fetchable with scp) rather than as a local path.
+    /// Only for media results, as a plain JSON result already carries its <c>path</c>.
+    /// </summary>
+    private static void AppendRemotePath(List<ContentBlock> blocks, JsonNode? result, SshAgent remote)
+    {
+        if (blocks.All(b => b is TextContentBlock)) return;
+        if (result is not JsonObject obj) return;
+        if (obj["path"] is not JsonValue val || !val.TryGetValue<string>(out var rel) || string.IsNullOrEmpty(rel)) return;
+        rel = rel.Replace('\\', '/');
+        if (rel.Contains("..", StringComparison.Ordinal) || rel.StartsWith('/')) return;
+        blocks.Add(new TextContentBlock { Text = "Saved on the server at " + remote.Describe(rel) });
+    }
 }
 
-public sealed record BridgePaths(string McpRoot, string SessionId, string DataPath);
+/// <summary>
+/// Where the bridge files live. <paramref name="Remote"/> is set when the game is reached
+/// over ssh; the local paths are then empty and every file goes through it.
+/// </summary>
+public sealed record BridgePaths(string McpRoot, string SessionId, string DataPath, SshAgent? Remote = null);
 
 public sealed class FileBridgeRegistry : IDisposable
 {
-    private readonly Dictionary<string, FileBridge> _bridges;
+    private readonly Dictionary<string, IBridge> _bridges;
 
     public FileBridgeRegistry(string mcpRoot, string sessionId, ILoggerFactory loggerFactory)
     {
-        _bridges = new Dictionary<string, FileBridge>(StringComparer.Ordinal)
+        _bridges = new Dictionary<string, IBridge>(StringComparer.Ordinal)
         {
             ["server"] = new FileBridge(mcpRoot, "server", sessionId, loggerFactory.CreateLogger("FileBridge[server]")),
             ["client"] = new FileBridge(mcpRoot, "client", sessionId, loggerFactory.CreateLogger("FileBridge[client]")),
         };
     }
 
-    public FileBridge Get(string realm) => _bridges[realm];
+    private FileBridgeRegistry(Dictionary<string, IBridge> bridges) => _bridges = bridges;
+
+    public static FileBridgeRegistry ForRemote(SshAgent agent, string sessionId) => new(
+        new Dictionary<string, IBridge>(StringComparer.Ordinal)
+        {
+            ["server"] = new SshBridge(agent, "server", sessionId),
+            ["client"] = new SshBridge(agent, "client", sessionId),
+        });
+
+    public IBridge Get(string realm) => _bridges[realm];
 
     public void Dispose()
     {

@@ -20,7 +20,7 @@ namespace GModMcpServer.Bridge;
 /// data dir see only their own response files. GMod treats the id as opaque and
 /// echoes it back unchanged.
 /// </summary>
-public sealed class FileBridge : IDisposable
+public sealed class FileBridge : IBridge
 {
     private readonly string _realm;
     private readonly string _inDir;

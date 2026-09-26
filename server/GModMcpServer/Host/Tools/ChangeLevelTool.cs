@@ -27,14 +27,14 @@ public sealed class ChangeLevelTool : IHostTool
     private readonly BridgePinger _pinger;
     private readonly FileBridgeRegistry _bridges;
     private readonly EngineLog _engineLog;
-    private readonly string _mcpRoot;
+    private readonly BridgePaths _paths;
 
     public ChangeLevelTool(BridgePinger pinger, FileBridgeRegistry bridges, EngineLog engineLog, BridgePaths paths)
     {
         _pinger = pinger;
         _bridges = bridges;
         _engineLog = engineLog;
-        _mcpRoot = paths.McpRoot;
+        _paths = paths;
     }
 
     public string Name => "host_changelevel";
@@ -151,12 +151,19 @@ public sealed class ChangeLevelTool : IHostTool
                 ["bootstrap_pending"] = server.BootstrapPending,
                 ["bootstrap_error"] = server.BootstrapError,
             },
-            ["client_ping"] = new JsonObject
+        };
+        if (server.Dedicated == true)
+        {
+            result["dedicated"] = true;
+        }
+        else
+        {
+            result["client_ping"] = new JsonObject
             {
                 ["reachable"] = client.Reachable,
                 ["enabled"] = client.Enabled,
-            },
-        };
+            };
+        }
 
         if (!ready)
         {
@@ -190,7 +197,12 @@ public sealed class ChangeLevelTool : IHostTool
     {
         try
         {
-            var marker = Path.Combine(_mcpRoot, "level_change.json");
+            if (_paths.Remote is { } remote)
+            {
+                remote.RemoveNoWait("mcp/level_change.json");
+                return;
+            }
+            var marker = Path.Combine(_paths.McpRoot, "level_change.json");
             if (File.Exists(marker)) File.Delete(marker);
         }
         catch

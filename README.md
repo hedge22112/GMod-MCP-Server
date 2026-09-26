@@ -31,6 +31,32 @@ Each .NET MCP host generates a per-process session GUID and prefixes its request
 
 See `docs/protocol.md` for the wire format.
 
+## Remote dedicated server (SSH)
+
+The MCP server can also drive a GMod server on another machine. Give it an ssh destination and it reaches that server's `garrysmod/data` through your own `ssh`:
+
+```
+claude mcp add gmod-remote -- dotnet run --project /absolute/path/to/server/GModMcpServer -- --ssh myserver
+```
+
+`myserver` is anything `ssh` accepts: a `~/.ssh/config` alias, `user@host`, and so on. Your ssh config, keys and agent are used as they are. There is no password prompt (`BatchMode=yes`), so `ssh myserver` must already work without one, and the host key must already be accepted.
+
+**On the server**, install the addon as usual, and set `mcp_enable 1` plus whichever `mcp_allow_*` capabilities you want in `server.cfg`. Add `-condebug` to the srcds command line if you want `engine_log` and the `events` stream. The server needs bash 4+ and coreutils, which any Linux server has. Nothing else is installed there: the host sends a small agent script over the ssh session on every connect.
+
+**Which folder** is used:
+- `--ssh myserver:/path/to/garrysmod/data` names it. `~/...` is expanded on the server.
+- With no path, the agent searches the ssh user's home (then `/home`, `/srv` and `/opt`). It picks the `garrysmod/data` that has already run this addon, and fails with the list of candidates if there is more than one.
+- `--data-path` also works and overrides the inline path.
+
+**What changes remotely:**
+- Every game tool works, but only the `_sv` ones reach a dedicated server. There is no client realm there, since the client bridge only runs for a listen-server host.
+- `host_status` reports the ssh session, the srcds process running from that install and whether it has `-condebug`, instead of a local `gmod.exe`.
+- `host_changelevel` and `mcp_reload` work as usual.
+- `host_launch` and `host_close` refuse. Start and stop the server however you normally do.
+- A dropped connection reconnects in the background. Tool calls made while it is down fail straight away with the ssh error.
+
+Each call costs one ssh round trip plus the game's own poll interval. The host doesn't poll over the network: the agent pushes each response back as soon as GMod writes it.
+
 ## Tools
 
 These are the **built-in** tools, grouped by where they run. This is **not** an exhaustive list of what a live game exposes: any addon can register its own tools (`MCP:AddFunction`) and capabilities (`MCP:AddCapability`), which then appear alongside the built-ins — [the TARDIS addon does exactly this](https://github.com/AmyJeanes/TARDIS/tree/dev/lua/mcp/functions) to add its `tardis_*` tools.

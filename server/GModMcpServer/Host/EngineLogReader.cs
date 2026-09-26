@@ -1,13 +1,118 @@
 using System.Text;
+using GModMcpServer.Remote;
 
 namespace GModMcpServer.Host;
+
+/// <summary>A byte range of the log and the file's total length when it was read.</summary>
+public sealed record LogChunk(long Length, long Start, byte[] Data);
+
+/// <summary>
+/// Random access to the log file, so the same tailing logic serves a local install and a
+/// remote one over ssh. Reads return the file length alongside the bytes because each
+/// remote call is a round trip.
+/// </summary>
+public interface ILogFile
+{
+    string DisplayPath { get; }
+
+    /// <summary>Length and last write time, or null when the file doesn't exist.</summary>
+    (long Length, DateTime LastWriteUtc)? Stat();
+
+    /// <summary>
+    /// Up to <paramref name="max"/> bytes from <paramref name="offset"/>, or from
+    /// <c>Length + offset</c> (clamped to 0) when it's negative. Null when the file doesn't exist.
+    /// </summary>
+    LogChunk? Read(long offset, int max);
+}
+
+public sealed class LocalLogFile : ILogFile
+{
+    private readonly string _path;
+
+    public LocalLogFile(string path) => _path = path;
+
+    public string DisplayPath => _path;
+
+    public (long Length, DateTime LastWriteUtc)? Stat()
+    {
+        var info = new FileInfo(_path);
+        return info.Exists ? (info.Length, info.LastWriteTimeUtc) : null;
+    }
+
+    public LogChunk? Read(long offset, int max)
+    {
+        if (!File.Exists(_path)) return null;
+
+        using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        var len = fs.Length;
+        var start = offset < 0 ? Math.Max(0, len + offset) : offset;
+        if (start >= len || max <= 0) return new LogChunk(len, start, Array.Empty<byte>());
+
+        fs.Seek(start, SeekOrigin.Begin);
+        var buf = new byte[(int)Math.Min(len - start, max)];
+        var n = ReadFull(fs, buf, buf.Length);
+        return new LogChunk(len, start, n == buf.Length ? buf : buf[..n]);
+    }
+
+    private static int ReadFull(Stream s, byte[] buf, int count)
+    {
+        var off = 0;
+        while (off < count)
+        {
+            var got = s.Read(buf, off, count - off);
+            if (got <= 0) break; // EOF (the file may have been appended-to concurrently; snapshot is fine)
+            off += got;
+        }
+        return off;
+    }
+}
+
+/// <summary>
+/// The log on a remote server. The reader's API is synchronous (it runs under
+/// <see cref="EngineLog"/>'s lock), so this blocks on the round trip. A dropped session
+/// throws rather than reading as a missing file, which would reset the caller's cursor
+/// and replay the whole log once it reconnects.
+/// </summary>
+public sealed class RemoteLogFile : ILogFile
+{
+    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
+
+    private readonly SshAgent _agent;
+    private readonly string _rel;
+
+    public RemoteLogFile(SshAgent agent, string rel)
+    {
+        _agent = agent;
+        _rel = rel;
+    }
+
+    public string DisplayPath => _agent.Describe(_rel);
+
+    public (long Length, DateTime LastWriteUtc)? Stat()
+    {
+        var st = Run(ct => _agent.StatAsync(_rel, ct));
+        return st is null ? null : (st.Length, st.LastWriteUtc);
+    }
+
+    public LogChunk? Read(long offset, int max)
+    {
+        var chunk = Run(ct => _agent.ReadAsync(_rel, offset, max, ct));
+        return chunk is null ? null : new LogChunk(chunk.Length, chunk.Start, chunk.Data);
+    }
+
+    private static T? Run<T>(Func<CancellationToken, Task<T?>> op) where T : class
+    {
+        using var cts = new CancellationTokenSource(Timeout);
+        return op(cts.Token).GetAwaiter().GetResult();
+    }
+}
 
 /// <summary>
 /// Tails GMod's engine console log (<c>garrysmod/console.log</c>, produced by
 /// <c>-condebug</c>). Pure file I/O with no persistent state — the caller owns the
 /// byte cursor — so it's unit-testable against a temp file.
 ///
-/// Reads use <see cref="FileShare.ReadWrite"/> because the engine holds the file
+/// Local reads use <see cref="FileShare.ReadWrite"/> because the engine holds the file
 /// open for writing the whole time (verified: shared reads succeed live). Decoding
 /// is Latin1 so every byte maps to exactly one char — byte offsets equal char
 /// indices, which keeps the cursor math exact — and no byte sequence can throw.
@@ -26,13 +131,15 @@ public sealed class EngineLogReader
     // How far back a no-cursor "tail" read looks.
     private const int TailWindowBytes = 256 * 1024;
 
-    private readonly string _path;
+    private readonly ILogFile _file;
 
-    public EngineLogReader(string path) => _path = path;
+    public EngineLogReader(string path) : this(new LocalLogFile(path)) { }
 
-    public bool Exists => File.Exists(_path);
+    public EngineLogReader(ILogFile file) => _file = file;
 
-    public long Length => File.Exists(_path) ? new FileInfo(_path).Length : 0;
+    public bool Exists => _file.Stat() is not null;
+
+    public long Length => _file.Stat()?.Length ?? 0;
 
     /// <summary>
     /// Return complete lines from <paramref name="cursor"/> up to the last newline,
@@ -41,18 +148,18 @@ public sealed class EngineLogReader
     /// </summary>
     public IReadOnlyList<string> ReadFrom(ref long cursor)
     {
-        if (!File.Exists(_path)) { cursor = 0; return Array.Empty<string>(); }
+        var chunk = _file.Read(cursor, MaxChunkBytes);
+        if (chunk is null) { cursor = 0; return Array.Empty<string>(); }
+        if (cursor > chunk.Length)               // truncated / rotated -> restart
+        {
+            cursor = 0;
+            chunk = _file.Read(0, MaxChunkBytes);
+            if (chunk is null) return Array.Empty<string>();
+        }
+        if (chunk.Data.Length == 0) return Array.Empty<string>();
 
-        using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        var len = fs.Length;
-        if (cursor > len) cursor = 0;          // truncated / rotated -> restart
-        if (cursor >= len) return Array.Empty<string>();
-
-        var toRead = (int)Math.Min(len - cursor, MaxChunkBytes);
-        fs.Seek(cursor, SeekOrigin.Begin);
-        var buf = new byte[toRead];
-        var n = ReadFull(fs, buf, toRead);
-        var text = Encoding.Latin1.GetString(buf, 0, n);
+        var n = chunk.Data.Length;
+        var text = Encoding.Latin1.GetString(chunk.Data);
 
         var lastNl = text.LastIndexOf('\n');
         if (lastNl < 0)
@@ -75,18 +182,12 @@ public sealed class EngineLogReader
     /// </summary>
     public (IReadOnlyList<string> Lines, long Cursor) ReadTail(int maxLines)
     {
-        if (!File.Exists(_path)) return (Array.Empty<string>(), 0);
+        var chunk = _file.Read(-TailWindowBytes, TailWindowBytes);
+        if (chunk is null) return (Array.Empty<string>(), 0);
 
-        using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        var len = fs.Length;
-        var start = Math.Max(0, len - TailWindowBytes);
-        fs.Seek(start, SeekOrigin.Begin);
-        var toRead = (int)(len - start);
-        var buf = new byte[toRead];
-        var n = ReadFull(fs, buf, toRead);
-        var text = Encoding.Latin1.GetString(buf, 0, n);
+        var text = Encoding.Latin1.GetString(chunk.Data);
 
-        if (start > 0)
+        if (chunk.Start > 0)
         {
             // Started mid-line; drop the partial first line.
             var firstNl = text.IndexOf('\n');
@@ -98,7 +199,7 @@ public sealed class EngineLogReader
         {
             lines = lines.Skip(lines.Count - maxLines).ToList();
         }
-        return (lines, len);
+        return (lines, chunk.Length);
     }
 
     private static List<string> SplitLines(string block)
@@ -108,17 +209,5 @@ public sealed class EngineLogReader
         var lines = new List<string>(raw.Length);
         foreach (var l in raw) lines.Add(l.TrimEnd('\r'));
         return lines;
-    }
-
-    private static int ReadFull(Stream s, byte[] buf, int count)
-    {
-        var off = 0;
-        while (off < count)
-        {
-            var got = s.Read(buf, off, count - off);
-            if (got <= 0) break; // EOF (the file may have been appended-to concurrently; snapshot is fine)
-            off += got;
-        }
-        return off;
     }
 }

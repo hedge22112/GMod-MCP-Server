@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using GModMcpServer.Remote;
 using ModelContextProtocol.Protocol;
 
 namespace GModMcpServer.Host;
@@ -41,6 +42,18 @@ internal static class HostToolHelpers
         Content = new List<ContentBlock> { new TextContentBlock { Text = text } },
         IsError = false,
     };
+
+    /// <summary>
+    /// For the tools that drive a local game process, when the bridge is pointed at a
+    /// remote server instead: starting and stopping that is the server's own job.
+    /// </summary>
+    public static CallToolResult RemoteUnsupported(string tool, SshAgent remote) => Err(new JsonObject
+    {
+        ["ok"] = false,
+        ["error"] = $"{tool} controls a GMod install on this machine, but this MCP server is connected to "
+            + $"{remote.Destination} over ssh. Start, stop or restart the dedicated server there; "
+            + "host_changelevel, mcp_reload and every game tool still work.",
+    }.ToJsonString());
 
     public static CallToolResult Err(string message) => new()
     {

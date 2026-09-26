@@ -1,5 +1,6 @@
 using System.Text.Json;
 using GModMcpServer.Models;
+using GModMcpServer.Remote;
 using Microsoft.Extensions.Logging;
 
 namespace GModMcpServer.Bridge;
@@ -7,15 +8,24 @@ namespace GModMcpServer.Bridge;
 /// <summary>
 /// Watches the per-realm manifest files written by GMod, merges them, and raises
 /// an event when the merged tool set changes (used to emit
-/// <c>notifications/tools/list_changed</c>).
+/// <c>notifications/tools/list_changed</c>). Locally the files are watched with a
+/// <see cref="FileSystemWatcher"/>; for a remote server the <see cref="SshAgent"/>
+/// pushes each file's content whenever its checksum changes.
 /// </summary>
 public sealed class ManifestWatcher : IDisposable
 {
+    private static readonly string[] Realms = { "server", "client" };
+
     private readonly string _mcpRoot;
     private readonly ILogger _log;
-    private readonly FileSystemWatcher _watcher;
+    private readonly FileSystemWatcher? _watcher;
     private readonly object _gate = new();
     private MergedManifest _current = new();
+
+    // Remote mode: the latest content pushed per realm (null = file absent), and a signal
+    // for the first time every realm has reported.
+    private readonly Dictionary<string, string?>? _remoteRaw;
+    private readonly TaskCompletionSource _initial = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -45,6 +55,35 @@ public sealed class ManifestWatcher : IDisposable
         _watcher.Deleted += (_, _) => Reload();
 
         Reload();
+        _initial.TrySetResult();
+    }
+
+    public ManifestWatcher(SshAgent agent, ILogger log)
+    {
+        _mcpRoot = "";
+        _log = log;
+        _remoteRaw = new Dictionary<string, string?>(StringComparer.Ordinal);
+        foreach (var realm in Realms)
+        {
+            agent.Track($"mcp/manifest_{realm}.json", raw =>
+            {
+                bool all;
+                lock (_gate)
+                {
+                    _remoteRaw[realm] = raw;
+                    all = _remoteRaw.Count == Realms.Length;
+                }
+                Reload();
+                if (all) _initial.TrySetResult();
+            });
+        }
+    }
+
+    /// <summary>Wait until every realm's manifest has been read once (immediate for a local game).</summary>
+    public async Task WaitForInitialAsync(TimeSpan timeout)
+    {
+        try { await _initial.Task.WaitAsync(timeout).ConfigureAwait(false); }
+        catch (TimeoutException) { /* the list catches up via list_changed */ }
     }
 
     private void Reload()
@@ -79,12 +118,23 @@ public sealed class ManifestWatcher : IDisposable
     private MergedManifest? LoadAndMerge()
     {
         var merged = new MergedManifest();
-        foreach (var realm in new[] { "server", "client" })
+        foreach (var realm in Realms)
         {
-            var path = Path.Combine(_mcpRoot, $"manifest_{realm}.json");
-            if (!File.Exists(path)) continue;
-
-            var manifest = ReadRealmManifest(path, realm);
+            RealmManifest? manifest;
+            if (_remoteRaw is not null)
+            {
+                string? raw;
+                lock (_gate) _remoteRaw.TryGetValue(realm, out raw);
+                if (raw is null) continue;
+                // A partial read is re-pushed once the write finishes (its checksum changes).
+                manifest = ParseRealmManifest(raw);
+            }
+            else
+            {
+                var path = Path.Combine(_mcpRoot, $"manifest_{realm}.json");
+                if (!File.Exists(path)) continue;
+                manifest = ReadRealmManifest(path, realm);
+            }
             if (manifest is null) return null;
 
             foreach (var fn in manifest.Functions)
@@ -131,8 +181,16 @@ public sealed class ManifestWatcher : IDisposable
         }
     }
 
+    private static RealmManifest? ParseRealmManifest(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        try { return JsonSerializer.Deserialize<RealmManifest>(raw, JsonOpts); }
+        catch (JsonException) { return null; }
+    }
+
     public void Dispose()
     {
+        if (_watcher is null) return;
         _watcher.EnableRaisingEvents = false;
         _watcher.Dispose();
     }

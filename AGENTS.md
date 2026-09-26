@@ -115,6 +115,18 @@ Editing an existing Lua tool file is enough — no console command needed. GMod'
 
 ConVar values (capability gates, `mcp_enable`) are `FCVAR_ARCHIVE` so they persist across reloads. Persisting across a game *restart* additionally needs a clean shutdown: GMod writes its archived server convars to `cfg/server.vdf` only on a proper window-close, so `host_close` does that by default (see Process tracking) — a force-kill loses any grants set that session.
 
+## Remote servers over ssh (`--ssh`)
+
+`--ssh <dest>[:<data path>]` points the host at a remote server's `garrysmod/data` instead of a local install. It is the same file protocol with a different transport, so the Lua side is unchanged. The one addition is `dedicated` on the server `_ping`.
+
+- **Transport** (`server/GModMcpServer/Remote/`): `SshAgent` runs one long-lived system `ssh` session (so the user's config, keys and agent apply; `BatchMode=yes` because there's no terminal to prompt on) and sends `agent.sh`, an embedded resource, as the remote command. The script travels base64 in the command line, which keeps stdin free for the line protocol documented at its top. The remote needs only bash 4+ and coreutils.
+- **Responses are pushed, not polled.** `SshBridge` registers a one-shot `watch` on its response file before writing the request, and the agent emits the file the moment it's non-empty. A file caught mid-write fails to parse and is simply re-watched. The manifests use `track` instead, re-pushed whenever their `cksum` changes, and `ManifestWatcher` has a remote constructor fed by it.
+- **console.log** goes through `ILogFile` (`LocalLogFile` / `RemoteLogFile`), so `EngineLogReader`'s cursor logic is shared. `RemoteLogFile` throws when the session is down rather than returning "missing": a missing file resets the passive cursor to 0, which would replay the whole log on reconnect.
+- **Reconnect**: the supervisor restarts ssh with backoff and re-sends outstanding watches and tracks on the agent's `hello`. Tagged requests in flight fail with the ssh error. Startup waits only for the first attempt, so an unreachable host fails fast instead of stalling the MCP handshake.
+- **Dedicated servers have no client realm** (see "Client bridge runs only for the listen-server host"). The server `_ping` reports `dedicated`, and the readiness waits (`WaitUntilReadyAsync`, `mcp_reload`) then stop pinging the client, which would otherwise always time out. The `level_change.json` marker is honoured on dedicated servers too, since only `_changelevel` ever writes it there.
+- **Host tools**: `host_launch`/`host_close` return `HostToolHelpers.RemoteUnsupported`. `host_status` has a remote branch that lists srcds processes whose `/proc/<pid>/cwd` is this install's game root, and reads `-condebug` from their command line.
+- **Tests** (`SshRemoteTests`) run the real `agent.sh` with a local bash standing in for ssh (the internal `SshAgent` constructor), so CI exercises the protocol end to end. On Windows they use Git Bash and pass the command through the environment, because MSYS re-parses a Windows command line differently from `ssh.exe`.
+
 ## Multi-host file IPC
 
 Multiple .NET MCP hosts can share the same GMod data dir (e.g. Claude Code + MCP Inspector running side-by-side). Each .NET host generates a per-process session GUID at startup and prefixes every request id with `<session>__`, so the response files are filtered by glob and never poach each other. GMod treats the prefixed id as opaque and echoes it back in the response filename. Cleanup of `mcp/<realm>/in,out/` happens in `MCP:StartBridge` (init + `mcp_reload`), so crashed-host orphans are reaped on next reload — no TTL janitor needed.

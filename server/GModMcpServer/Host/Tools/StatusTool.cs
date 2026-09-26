@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using GModMcpServer.Bridge;
+using GModMcpServer.Remote;
 using ModelContextProtocol.Protocol;
 
 namespace GModMcpServer.Host.Tools;
@@ -11,13 +12,15 @@ public sealed class StatusTool : IHostTool
     private readonly ManifestWatcher _manifest;
     private readonly BridgePinger _pinger;
     private readonly EngineLog _engineLog;
+    private readonly BridgePaths _paths;
 
-    public StatusTool(GameProcessManager proc, ManifestWatcher manifest, BridgePinger pinger, EngineLog engineLog)
+    public StatusTool(GameProcessManager proc, ManifestWatcher manifest, BridgePinger pinger, EngineLog engineLog, BridgePaths paths)
     {
         _proc = proc;
         _manifest = manifest;
         _pinger = pinger;
         _engineLog = engineLog;
+        _paths = paths;
     }
 
     public string Name => "host_status";
@@ -33,6 +36,11 @@ public sealed class StatusTool : IHostTool
 
     public async ValueTask<CallToolResult> InvokeAsync(IDictionary<string, JsonElement>? args, CancellationToken ct)
     {
+        if (_paths.Remote is { } remote)
+        {
+            return await RemoteStatusAsync(remote, ct).ConfigureAwait(false);
+        }
+
         var snap = _proc.Snapshot();
         var manifest = _manifest.Current;
 
@@ -46,30 +54,7 @@ public sealed class StatusTool : IHostTool
         {
             var p = await _pinger.PingAsync(ct).ConfigureAwait(false);
             ping = p;
-            bridgeNode["reachable"] = p.Reachable;
-            bridgeNode["latency_ms"] = p.LatencyMs;
-            bridgeNode["enabled"] = p.Enabled;
-            bridgeNode["map"] = p.Map;
-            bridgeNode["maxplayers"] = p.MaxPlayers;
-            bridgeNode["singleplayer"] = p.SinglePlayer;
-            bridgeNode["bootstrap_pending"] = p.BootstrapPending;
-            bridgeNode["bootstrap_error"] = p.BootstrapError;
-            if (p.BootstrapError != null)
-            {
-                bridgeNode["hint"] = p.BootstrapError;
-            }
-            else if (!p.Reachable)
-            {
-                bridgeNode["hint"] = "GMod is running but the bridge didn't respond — likely still loading, or paused on a menu.";
-            }
-            else if (p.BootstrapPending == true)
-            {
-                bridgeNode["hint"] = "Bridge reachable but the host_launch bootstrap is still in progress (workshop mount or post-mount map transition).";
-            }
-            else if (p.Enabled == false)
-            {
-                bridgeNode["hint"] = "Bridge reachable but mcp_enable is 0. Run `mcp_enable 1` in the GMod console to allow tool dispatch.";
-            }
+            FillPing(bridgeNode, p, "GMod is running but the bridge didn't respond — likely still loading, or paused on a menu.");
         }
         else
         {
@@ -82,26 +67,7 @@ public sealed class StatusTool : IHostTool
             bridgeNode["bootstrap_pending"] = null;
         }
 
-        // Capabilities: prefer the live convar values carried on the ping (so a convar
-        // flipped after registration reads correctly); fall back to the manifest snapshot
-        // when GMod is down or the ping carried none (older addon build).
-        var capabilities = new JsonArray();
-        foreach (var cap in manifest.Capabilities.Values)
-        {
-            var current = cap.Current;
-            if (ping is { Capabilities: { } liveCaps } && liveCaps.TryGetValue(cap.Id, out var liveVal))
-            {
-                current = liveVal;
-            }
-            capabilities.Add(new JsonObject
-            {
-                ["id"] = cap.Id,
-                ["convar"] = cap.ConVar,
-                ["current"] = current,
-                ["default"] = cap.Default,
-            });
-        }
-        bridgeNode["capabilities"] = capabilities;
+        bridgeNode["capabilities"] = Capabilities(manifest, ping);
 
         // Engine-log capture. `condebug` is the definitive signal: it reads the running
         // process's real command line (via WMI), so it's right even for a Steam-started
@@ -154,5 +120,127 @@ public sealed class StatusTool : IHostTool
         };
 
         return HostToolHelpers.Ok(result.ToJsonString());
+    }
+
+    // A remote server isn't a local process: whether it's up comes from the srcds
+    // processes the agent finds in that install, and the ping is always sent.
+    private async ValueTask<CallToolResult> RemoteStatusAsync(SshAgent remote, CancellationToken ct)
+    {
+        var manifest = _manifest.Current;
+        var remoteNode = new JsonObject
+        {
+            ["ssh"] = remote.Destination,
+            ["connected"] = remote.Connected,
+            ["data_path"] = remote.DataPath,
+            ["system"] = remote.RemoteSystem,
+        };
+
+        if (!remote.Connected)
+        {
+            remoteNode["error"] = remote.LastError;
+            remoteNode["hint"] = "The ssh session isn't up; it retries in the background. Check that `ssh "
+                + remote.Destination + "` works non-interactively (key or agent auth, host key already accepted).";
+            return HostToolHelpers.Ok(new JsonObject
+            {
+                ["ok"] = true,
+                ["remote"] = remoteNode,
+                ["bridge"] = new JsonObject { ["tools"] = manifest.Tools.Count, ["reachable"] = false },
+            }.ToJsonString());
+        }
+
+        IReadOnlyList<RemoteProcess> procs;
+        try { procs = await remote.ListProcessesAsync(ct).ConfigureAwait(false); }
+        catch { procs = Array.Empty<RemoteProcess>(); }
+
+        var gmodNode = new JsonObject { ["running"] = procs.Count > 0 };
+        if (procs.Count > 0)
+        {
+            gmodNode["pid"] = procs[0].Pid;
+            gmodNode["uptime_seconds"] = procs[0].ElapsedSeconds;
+            gmodNode["command_line"] = procs[0].CommandLine;
+        }
+
+        var p = await _pinger.PingAsync(ct).ConfigureAwait(false);
+        var bridgeNode = new JsonObject { ["tools"] = manifest.Tools.Count };
+        FillPing(bridgeNode, p, procs.Count > 0
+            ? "The server is running but the bridge didn't respond — likely still loading, or the addon isn't installed there."
+            : "No srcds process found in this install and the bridge didn't respond — is the server running?");
+        bridgeNode["dedicated"] = p.Dedicated;
+        bridgeNode["capabilities"] = Capabilities(manifest, p);
+
+        bool? condebug = procs.Count > 0 ? GameProcessManager.HasCondebug(procs[0].CommandLine) : null;
+        var lastWrite = _engineLog.LastWriteUtc;
+        var recentlyWritten = lastWrite is { } t && (DateTime.UtcNow - t).TotalSeconds < 30;
+        var engineNode = new JsonObject
+        {
+            ["condebug"] = condebug,
+            ["present"] = lastWrite is not null,
+            ["path"] = _engineLog.Path,
+            ["recently_written"] = recentlyWritten,
+            ["note"] = condebug == false
+                ? "-condebug is NOT on the server's command line, so engine output isn't captured: engine_log and the events stream miss it. Add -condebug to the srcds launch options."
+                : "engine_log and the events stream read the server's console.log over ssh.",
+        };
+
+        return HostToolHelpers.Ok(new JsonObject
+        {
+            ["ok"] = true,
+            ["remote"] = remoteNode,
+            ["gmod"] = gmodNode,
+            ["bridge"] = bridgeNode,
+            ["engine_log"] = engineNode,
+        }.ToJsonString());
+    }
+
+    private static void FillPing(JsonObject node, BridgePingResult p, string unreachableHint)
+    {
+        node["reachable"] = p.Reachable;
+        node["latency_ms"] = p.LatencyMs;
+        node["enabled"] = p.Enabled;
+        node["map"] = p.Map;
+        node["maxplayers"] = p.MaxPlayers;
+        node["singleplayer"] = p.SinglePlayer;
+        node["bootstrap_pending"] = p.BootstrapPending;
+        node["bootstrap_error"] = p.BootstrapError;
+        if (p.BootstrapError != null)
+        {
+            node["hint"] = p.BootstrapError;
+        }
+        else if (!p.Reachable)
+        {
+            node["hint"] = unreachableHint;
+        }
+        else if (p.BootstrapPending == true)
+        {
+            node["hint"] = "Bridge reachable but the host_launch bootstrap is still in progress (workshop mount or post-mount map transition).";
+        }
+        else if (p.Enabled == false)
+        {
+            node["hint"] = "Bridge reachable but mcp_enable is 0. Run `mcp_enable 1` in the GMod console to allow tool dispatch.";
+        }
+    }
+
+    // Capabilities: prefer the live convar values carried on the ping (so a convar
+    // flipped after registration reads correctly); fall back to the manifest snapshot
+    // when GMod is down or the ping carried none (older addon build).
+    private static JsonArray Capabilities(MergedManifest manifest, BridgePingResult? ping)
+    {
+        var capabilities = new JsonArray();
+        foreach (var cap in manifest.Capabilities.Values)
+        {
+            var current = cap.Current;
+            if (ping is { Capabilities: { } liveCaps } && liveCaps.TryGetValue(cap.Id, out var liveVal))
+            {
+                current = liveVal;
+            }
+            capabilities.Add(new JsonObject
+            {
+                ["id"] = cap.Id,
+                ["convar"] = cap.ConVar,
+                ["current"] = current,
+                ["default"] = cap.Default,
+            });
+        }
+        return capabilities;
     }
 }
