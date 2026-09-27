@@ -23,6 +23,21 @@ The repo is the GMod addon: clone it directly into `garrysmod/addons/`. The .NET
 4. **Launch GMod** via the `host_launch` tool, or start it yourself. The bridge runs regardless, but tool dispatch requires opting in: in the GMod developer console, run `mcp_enable 1`. Sensitive tools additionally need their capability granted — see [Capabilities](#capabilities).
 5. **Verify**: the host and game tools (see [Tools](#tools)) appear in your assistant's tool list, and `host_status` reports `bridge.reachable: true` once GMod is running and responsive.
 
+## Serving over HTTP (`--mcp`)
+
+By default the MCP server speaks stdio, so each client starts its own copy. Pass `--mcp` to run it as a long-lived [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http) server instead. Several clients can then share one host.
+
+```
+dotnet run --project /absolute/path/to/server/GModMcpServer -- --mcp 5123
+claude mcp add --transport http gmod http://127.0.0.1:5123/mcp
+```
+
+- `--mcp 5123` listens on `http://127.0.0.1:5123/mcp`, which is reachable from this machine only.
+- `--mcp http://<host>:<port>[/path]` picks the bind address and endpoint path. `/mcp` is the default; use `0.0.0.0` for all interfaces.
+- Browser requests from a foreign `Origin` get a 403, which blocks DNS-rebinding attacks from web pages.
+
+There is no authentication. Anyone who can reach the port can call every tool you've granted a capability to, including `unsafe` ones that run arbitrary Lua. Keep the default loopback bind unless the network is trusted, or put it behind a reverse proxy that authenticates.
+
 ## How it works
 
 GMod cannot run a listening socket from pure Lua, and `http.Fetch`/`HTTP()` block private-IP destinations on listen and singleplayer servers. This addon uses **file-based IPC** via `garrysmod/data/mcp/` — the server-realm and client-realm bridges run independent poll loops, the .NET host polls the response files, and big payloads like screenshots never traverse `net.WriteString`. No binary modules required.

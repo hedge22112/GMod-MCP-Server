@@ -3,6 +3,10 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using GModMcpServer.Bridge;
 using GModMcpServer.Host;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using ModelContextProtocol.AspNetCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -37,8 +41,41 @@ internal static class Program
 
     public static async Task<int> Main(string[] args)
     {
-        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder(args);
+        // --mcp <url> serves Streamable HTTP instead of stdio. Read it before picking a
+        // builder, since the HTTP path needs a WebApplication.
+        var bootConfig = new ConfigurationBuilder()
+            .AddEnvironmentVariables(prefix: "MCP_")
+            .AddCommandLine(args)
+            .Build();
+        var mcpUrl = bootConfig["mcp"];
 
+        if (string.IsNullOrWhiteSpace(mcpUrl))
+        {
+            var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder(args);
+            ConfigureGModServices(builder, args, http: false);
+            await builder.Build().RunAsync().ConfigureAwait(false);
+            return 0;
+        }
+
+        var listen = McpListen.Parse(mcpUrl);
+        var webBuilder = WebApplication.CreateBuilder(args);
+        webBuilder.WebHost.UseUrls(listen.BaseUrl);
+        ConfigureGModServices(webBuilder, args, http: true);
+
+        var app = webBuilder.Build();
+        MapGModMcp(app, listen);
+        app.Lifetime.ApplicationStarted.Register(() =>
+            app.Logger.LogInformation("GMod MCP server listening on {Endpoint}", listen.Endpoint));
+        await app.RunAsync().ConfigureAwait(false);
+        return 0;
+    }
+
+    /// <summary>
+    /// Everything both transports share: config sources, stderr logging, the bridge and
+    /// host-tool services, and the MCP server itself.
+    /// </summary>
+    internal static void ConfigureGModServices(IHostApplicationBuilder builder, string[] args, bool http)
+    {
         builder.Configuration
             .AddEnvironmentVariables(prefix: "MCP_")
             .AddCommandLine(args);
@@ -77,30 +114,42 @@ internal static class Program
             builder.Services.AddSingleton(typeof(IHostTool), toolType);
         }
 
-        AddGModMcpServer(builder.Services);
+        AddGModMcpServer(builder.Services, http);
 
         builder.Services.AddHostedService<BridgeHostedService>();
-
-        var host = builder.Build();
-        await host.RunAsync().ConfigureAwait(false);
-        return 0;
     }
 
     /// <summary>
-    /// Registers the MCP server: stdio transport, the dynamic tool handlers, and —
-    /// crucially — advertises <c>tools.listChanged</c> so clients honour the
-    /// <c>notifications/tools/list_changed</c> we emit on manifest changes. The manual
-    /// <c>WithListToolsHandler</c> path leaves that flag unset (only the
-    /// attribute/collection tool path auto-sets it), so we flip it last, on the Tools
+    /// Registers the MCP server: the transport (stdio, or Streamable HTTP for --mcp), the
+    /// dynamic tool handlers, and — crucially — advertises <c>tools.listChanged</c> so
+    /// clients honour the <c>notifications/tools/list_changed</c> we emit on manifest
+    /// changes. The manual <c>WithListToolsHandler</c> path leaves that flag unset (only
+    /// the attribute/collection tool path auto-sets it), so we flip it last, on the Tools
     /// capability the handler wiring already created. Shared with the tests so the
     /// capability advertisement can't silently regress.
     /// </summary>
-    internal static void AddGModMcpServer(IServiceCollection services)
+    internal static void AddGModMcpServer(IServiceCollection services, bool http = false)
     {
-        services
-            .AddMcpServer(options => options.ServerInstructions = ServerInstructionsText)
-            .WithStdioServerTransport()
-            .WithListToolsHandler(ListToolsAsync)
+        var mcp = services.AddMcpServer(options => options.ServerInstructions = ServerInstructionsText);
+        if (http)
+        {
+            mcp.WithHttpTransport(options =>
+            {
+                // Stateful: list_changed and job follow-ups are pushed on the session's
+                // GET stream, which stateless mode doesn't have.
+                options.SessionMode = HttpServerSessionMode.Stateful;
+                // Experimental, but it's the only hook that sees a session end, which is
+                // when its server must leave the list_changed fan-out.
+#pragma warning disable MCPEXP002
+                options.RunSessionHandler = RunHttpSessionAsync;
+#pragma warning restore MCPEXP002
+            });
+        }
+        else
+        {
+            mcp.WithStdioServerTransport();
+        }
+        mcp.WithListToolsHandler(ListToolsAsync)
             .WithCallToolHandler(CallToolAsync);
 
         services.Configure<McpServerOptions>(options =>
@@ -109,6 +158,42 @@ internal static class Program
             options.Capabilities.Tools ??= new ToolsCapability();
             options.Capabilities.Tools.ListChanged = true;
         });
+    }
+
+    /// <summary>
+    /// Each HTTP client gets its own <see cref="McpServer"/>; track it for the session's
+    /// lifetime so manifest changes reach every connected client, not just the first.
+    /// </summary>
+    private static async Task RunHttpSessionAsync(HttpContext http, McpServer server, CancellationToken ct)
+    {
+        var accessor = http.RequestServices.GetRequiredService<McpServerAccessor>();
+        accessor.Add(server);
+        try
+        {
+            await server.RunAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            accessor.Remove(server);
+        }
+    }
+
+    /// <summary>
+    /// Maps the MCP endpoint behind an Origin check. The spec requires it: without one, a
+    /// web page can reach a loopback-bound server through DNS rebinding and call its tools.
+    /// </summary>
+    internal static void MapGModMcp(WebApplication app, McpListen listen)
+    {
+        app.Use(async (context, next) =>
+        {
+            if (!listen.IsAllowedOrigin(context.Request.Headers.Origin))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
+            await next(context).ConfigureAwait(false);
+        });
+        app.MapMcp(listen.Path);
     }
 
     private static string ResolveDataPath(IConfiguration cfg)
@@ -151,7 +236,7 @@ internal static class Program
         RequestContext<ListToolsRequestParams> ctx, CancellationToken ct)
     {
         var services = ctx.Services ?? throw new InvalidOperationException("RequestContext.Services is null");
-        services.GetRequiredService<McpServerAccessor>().TrySet(ctx.Server);
+        services.GetRequiredService<McpServerAccessor>().Add(ctx.Server);
         var watcher = services.GetRequiredService<ManifestWatcher>();
         var hostTools = services.GetServices<IHostTool>();
 
@@ -203,7 +288,7 @@ internal static class Program
         RequestContext<CallToolRequestParams> ctx, CancellationToken ct)
     {
         var services = ctx.Services ?? throw new InvalidOperationException("RequestContext.Services is null");
-        services.GetRequiredService<McpServerAccessor>().TrySet(ctx.Server);
+        services.GetRequiredService<McpServerAccessor>().Add(ctx.Server);
 
         var (result, jobEvents) = await DispatchToolAsync(ctx, services, ct).ConfigureAwait(false);
 
@@ -499,25 +584,27 @@ internal sealed class BridgeHostedService : BackgroundService
 
         EventHandler<MergedManifest> handler = (_, _) =>
         {
-            // Captured server reference is populated lazily on the first tool call
-            // (see ListToolsAsync / CallToolAsync). Before that, MCP clients still
-            // fetch a fresh tools/list on connect, so missing the very first
-            // manifest write is harmless.
-            var server = _serverAccessor.Server;
-            if (server is null) return;
-            _ = Task.Run(async () =>
+            // Stdio's server is captured lazily on the first tool call (see ListToolsAsync /
+            // CallToolAsync); clients fetch a fresh tools/list on connect, so missing the
+            // very first manifest write is harmless. HTTP sessions register on start.
+            foreach (var server in _serverAccessor.Servers)
             {
-                try
+                _ = Task.Run(async () =>
                 {
-                    await server.SendNotificationAsync(
-                        NotificationMethods.ToolListChangedNotification,
-                        stoppingToken).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "Failed to send tools/list_changed notification");
-                }
-            }, stoppingToken);
+                    try
+                    {
+                        await server.SendNotificationAsync(
+                            NotificationMethods.ToolListChangedNotification,
+                            stoppingToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        // A session that can't take a notification is gone; stop sending to it.
+                        _serverAccessor.Remove(server);
+                        _log.LogWarning(ex, "Failed to send tools/list_changed notification");
+                    }
+                }, stoppingToken);
+            }
         };
 
         _watcher.Changed += handler;

@@ -8,12 +8,13 @@ public class ServerCapabilitiesTests
 {
     // Guards the regression where the server emitted notifications/tools/list_changed
     // without advertising the capability, so spec-compliant clients ignored it.
-    [Test]
-    public void Server_AdvertisesToolsListChanged()
+    [TestCase(false)]
+    [TestCase(true)]
+    public void Server_AdvertisesToolsListChanged(bool http)
     {
         var services = new ServiceCollection();
         services.AddLogging();
-        Program.AddGModMcpServer(services);
+        Program.AddGModMcpServer(services, http);
 
         using var provider = services.BuildServiceProvider();
         var options = provider.GetRequiredService<IOptions<McpServerOptions>>().Value;

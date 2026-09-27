@@ -12,15 +12,18 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Also supplies the Microsoft.Extensions hosting, logging and configuration packages. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="GModMcpServer.Tests" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.CommandLine" Version="10.0.12" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.12" />
+    <!-- Streamable HTTP transport, used only when the mcp option is passed. -->
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
     <!-- Windows-only: read the real command line of a running gmod.exe we didn't launch
          (WMI Win32_Process), so host_status can definitively report whether -condebug is on. -->
     <PackageReference Include="System.Management" Version="10.0.12" />
