@@ -38,6 +38,32 @@ claude mcp add --transport http gmod http://127.0.0.1:5123/mcp
 
 There is no authentication. Anyone who can reach the port can call every tool you've granted a capability to, including `unsafe` ones that run arbitrary Lua. Keep the default loopback bind unless the network is trusted, or put it behind a reverse proxy that authenticates.
 
+## Dedicated servers
+
+A dedicated server has no local player and no client realm, so there are no `_cl` tools. To run the MCP server on the server's own machine and reach it over HTTP:
+
+```
+dotnet run --project /path/to/server/GModMcpServer -- \
+  --mcp http://0.0.0.0:5123 \
+  --data-path /srv/gmod/garrysmod/data \
+  --server-start "systemctl start gmod" \
+  --server-stop "systemctl stop gmod" \
+  --rcon 127.0.0.1:27015
+```
+
+**Controlling the server.** All three options are optional:
+- `--server-start` is what `host_launch` runs. It can use `{map}`, `{gamemode}` and `{maxplayers}`, filled from the tool's arguments. The command must return once the server is starting (`systemctl`, `screen -dmS`, `tmux new -d`, `nohup ... &`). `host_launch` then waits for the server's bridge.
+- `--server-stop` is what `host_close` runs. Without it, `host_close` sends `quit` over RCON, which shuts the server down cleanly and saves its config.
+- `--rcon host[:port]` enables `host_rcon`, a console that works even while the bridge is down (for example to run `mcp_enable 1`). The password goes in the `MCP_RCON_PASSWORD` environment variable, not on the command line.
+- `host_status` pings the server even though no `gmod.exe` is running, and lists this configuration.
+
+**Server setup.** Install the addon as usual. Set `mcp_enable 1` and the `mcp_allow_*` capabilities you want in `server.cfg`. Add `-condebug` to the srcds command line so `engine_log` and the `events` stream work.
+
+**Working without a host player.**
+- Tools that default to "you" (`player_state`, `player_trace`, `entity_find`'s sort centre) pick the only human connected. With nobody, or with several players, they list who is connected so you can pick one by name or userid. `entity_find` also takes `around_player`.
+- For testing, bots stand in for a player: spawn one with `bot_spawn_sv`, move it with `player_walk_sv`, and read it with `player_state_sv`.
+- To see what a connected player's client sees, use `player_client_read_sv`. It runs `entity_find`, `entity_state`, `player_state`, `player_trace`, `world_trace` or a player-view `screenshot` on that player's client. The player has to opt in on their own machine with `mcp_client_share 1`; it's off by default. A screenshot is saved on the server under `data/mcp/screenshots/`.
+
 ## How it works
 
 GMod cannot run a listening socket from pure Lua, and `http.Fetch`/`HTTP()` block private-IP destinations on listen and singleplayer servers. This addon uses **file-based IPC** via `garrysmod/data/mcp/` — the server-realm and client-realm bridges run independent poll loops, the .NET host polls the response files, and big payloads like screenshots never traverse `net.WriteString`. No binary modules required.
@@ -65,6 +91,7 @@ Implemented by the .NET MCP server itself — available even when GMod isn't run
 | `host_changelevel` | Change the map of the already-running GMod server and block until the new map is ready before returning (the in-game sibling of host_launch's readiness wait). |
 | `mcp_reload` | Reload the in-game MCP addon (re-run its Lua and restart the bridge) and block until the bridge is back and ready before returning — the host-managed equivalent of running `mcp_reload` in the GMod console, but without the timeout a bare reload causes (the reload tears the bridge down mid-call). |
 | `engine_log` | Read the tail of GMod's engine console log (console.log) — the raw, unfiltered console: engine-native C++ output (`Bad SetLocalOrigin`, `Crazy origin`, asset/mount spew, engine errors) plus both realms' Lua output, interleaved. |
+| `host_rcon` | Run a console command on a dedicated server over Source RCON and return its output. |
 <!-- TOOLS:HOST:END -->
 
 ### Game tools
@@ -123,6 +150,7 @@ Dispatched into the running game over the file bridge. The framework appends `_s
 | `lua_run_sv` | server | `unsafe` | Compile and execute Lua source in this realm. |
 | `model_info_cl` | client | — | Structured info about a model ASSET without spawning a prop -- read straight from the model file via util.GetModelInfo (no entity, no spawn), so it is synchronous and realm-identical. |
 | `model_info_sv` | server | — | Structured info about a model ASSET without spawning a prop -- read straight from the model file via util.GetModelInfo (no entity, no spawn), so it is synchronous and realm-identical. |
+| `player_client_read_sv` | server | — | Run a read tool on a remote player's client and return its result: what that client sees, which the server realm can't (client prediction, PVS/dormancy, the rendered frame). |
 | `player_lua_run_sv` | server | `unsafe` | Compile and execute Lua source on a target player's client realm and return the result. |
 | `player_set_sv` | server | `player_control` | Set a player or bot's pose and state, then wait for it to settle and confirm it stuck. |
 | `player_state_cl` | client | — | Structured snapshot of a player (or all players) -- identity, vitals, eye position/aim, velocity, movement state (movetype, on_ground, crouching, ducking, frozen, godmode, water_level), view offset and collision hull, model/animation sequence, playermodel and weapon colours, and active weapon, in one read. |

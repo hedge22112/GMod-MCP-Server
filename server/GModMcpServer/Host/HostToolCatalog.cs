@@ -21,13 +21,15 @@ public static class HostToolCatalog
         typeof(ChangeLevelTool),
         typeof(ReloadTool),
         typeof(EngineLogTool),
+        typeof(RconTool),
     };
 
     /// <summary>
     /// Build each tool with throwaway constructor dependencies and read its
     /// metadata. Safe because a host tool's Name/Description/InputSchema never
     /// read their injected services — only <c>BridgePaths.McpRoot</c> is touched
-    /// in a constructor, so that one dependency is supplied. If a future tool
+    /// in a constructor, so that one dependency is supplied (plus an unconfigured
+    /// <see cref="DedicatedServer"/>). If a future tool
     /// reads a service to compute its schema this throws (caught in CI), the cue
     /// to hand it a real dependency here.
     /// </summary>
@@ -47,8 +49,10 @@ public static class HostToolCatalog
         var ctor = type.GetConstructors().Single();
         var args = ctor.GetParameters()
             .Select(p => p.ParameterType == typeof(BridgePaths)
-                ? (object?)new BridgePaths("", "", "")
-                : null)
+                ? new BridgePaths("", "", "")
+                : p.ParameterType == typeof(DedicatedServer)
+                    ? (object?)new DedicatedServer(null, null, null)
+                    : null)
             .ToArray();
         return (IHostTool)ctor.Invoke(args);
     }

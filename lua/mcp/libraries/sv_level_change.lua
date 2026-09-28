@@ -14,8 +14,7 @@ local FALLBACK_HOOK = "MCP_LevelChange_Fallback"
 
 -- Fresh boot after the map command: a marker on disk means we're mid-transition,
 -- so keep bootstrap_pending true until InitPostEntity confirms the new map is up.
-MCP._bootstrap_pending = MCP._bootstrap_pending
-    or (not game.IsDedicated() and file.Exists(MARKER, "DATA"))
+MCP._bootstrap_pending = MCP._bootstrap_pending or file.Exists(MARKER, "DATA")
 
 hook.Add("InitPostEntity", CLEAR_HOOK, function()
     hook.Remove("InitPostEntity", CLEAR_HOOK)

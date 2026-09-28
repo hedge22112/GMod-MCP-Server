@@ -37,7 +37,18 @@ internal static class Program
         "context, not part of the tool's primary result. Sourced from console.log, so it needs " +
         "GMod launched with -condebug (host_launch adds it; host_status.condebug confirms). " +
         "engine_log reads the full raw console.log tail on demand (including boot, which the " +
-        "passive stream skips).";
+        "passive stream skips). " +
+        "On a dedicated server (host_status bridge.dedicated) there is no client realm, so no _cl tools: " +
+        "use the _sv tools, spawn bots (bot_spawn_sv) and drive them (player_walk_sv) to stand in for a " +
+        "player, and use player_client_read_sv to look through a connected player's client (they opt in " +
+        "with mcp_client_share 1). Tools that default to \"you\" pick the only human connected, else ask.";
+
+    // Added when this host runs next to a dedicated server (--server-start/--server-stop/--rcon).
+    private const string DedicatedInstructionsText =
+        " This MCP server controls a dedicated server: host_launch runs the configured start command and " +
+        "waits for the server's bridge, host_close stops it, and host_rcon runs console commands over RCON " +
+        "even when the bridge is down (e.g. `mcp_enable 1`). Put -condebug on the srcds command line for " +
+        "engine_log and the events stream.";
 
     public static async Task<int> Main(string[] args)
     {
@@ -105,6 +116,10 @@ internal static class Program
         builder.Services.AddSingleton<GameProcessManager>(sp =>
             new GameProcessManager(gameRoot, sp.GetRequiredService<ILoggerFactory>().CreateLogger<GameProcessManager>()));
 
+        // --server-start/--server-stop/--rcon: how host_launch/host_close/host_rcon drive a dedicated
+        // server next to this host. Parsed now so a bad --rcon fails at startup, not on first use.
+        builder.Services.AddSingleton(DedicatedServer.FromConfig(builder.Configuration));
+
         builder.Services.AddSingleton<McpServerAccessor>();
 
         // Host tools come from the catalog so registration and the tool-list
@@ -151,6 +166,14 @@ internal static class Program
         }
         mcp.WithListToolsHandler(ListToolsAsync)
             .WithCallToolHandler(CallToolAsync);
+
+        services.AddOptions<McpServerOptions>().Configure<IServiceProvider>((options, sp) =>
+        {
+            if (sp.GetService<DedicatedServer>() is { Configured: true })
+            {
+                options.ServerInstructions += DedicatedInstructionsText;
+            }
+        });
 
         services.Configure<McpServerOptions>(options =>
         {

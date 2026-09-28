@@ -16,10 +16,36 @@ local function findHost()
     return nil
 end
 
+-- The "me" player for a tool called with no subject: the listen/SP host, or on a
+-- dedicated server (which has no host) the only human connected. Returns (ply, err,
+-- isHost); err lists who is connected so the caller can pick.
+---@return Player? ply
+---@return string? err
+---@return boolean? isHost
+function MCP.player.Default()
+    local h = findHost()
+    if h then return h, nil, true end
+    local humans = player.GetHumans()
+    if #humans == 1 then return humans[1], nil, false end
+
+    local listed = {}
+    for i, p in ipairs(player.GetAll()) do
+        if i > 12 then
+            listed[#listed + 1] = "..."
+            break
+        end
+        listed[#listed + 1] = p:Nick() .. " (userid " .. p:UserID() .. (p:IsBot() and ", bot" or "") .. ")"
+    end
+    if #listed == 0 then
+        return nil, "no host player and nobody is connected (a dedicated server has no host; spawn a bot with bot_spawn to have a player to target)"
+    end
+    return nil, "no host player and " .. #humans .. " humans connected, so there is no default; pick one by name/userid: " .. table.concat(listed, ", ")
+end
+
 -- Resolve the subject(s) from exactly one of host/bot/name/userid/entindex/all. Returns
 -- (list, err): a single-element list for the singular selectors, the full player list for
 -- `all`. err is set (list nil) on >1 selector, a disallowed selector, or a miss.
--- opts: default_host (no selector -> host, the "me" case for a read tool); allow_all and
+-- opts: default_host (no selector -> MCP.player.Default, the "me" case for a read tool); allow_all and
 -- allow_host (default true) -- the write tools that resolve exactly one player pass
 -- allow_all=false (player_set/player_walk), and player_walk also allow_host=false (it has
 -- no host shortcut, only entindex/name with a warning). Messages name only the permitted set.
@@ -63,9 +89,9 @@ function MCP.player.Resolve(args, opts)
         if not opts.default_host then
             return nil, "specify exactly one subject: " .. permittedStr
         end
-        local h = findHost()
-        if not h then return nil, "no listen-server host player found; specify " .. permittedStr end
-        return { h }
+        local d, derr = MCP.player.Default()
+        if not d then return nil, derr end
+        return { d }
     end
 
     if args.all then

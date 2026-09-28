@@ -134,6 +134,32 @@ public class BridgeDualReadinessTests
         });
     }
 
+    [Test]
+    public async Task WaitUntilReady_SkipsClient_OnDedicatedServer()
+    {
+        // A dedicated server has no client realm behind the bridge; nothing answers
+        // there, so waiting for it would always time out.
+        using var root = new TempBridgeRoot();
+        using var server = new FakeGmodResponder(root.McpRoot, "server", _ =>
+        {
+            var ping = ServerPing("gm_construct", pending: false);
+            ping["dedicated"] = true;
+            return ping;
+        });
+        using var registry = new FileBridgeRegistry(root.McpRoot, NewSessionId(), NullLoggerFactory.Instance);
+        var pinger = new BridgePinger(registry);
+
+        var (ready, srv, cli, _) = await pinger.WaitUntilReadyAsync(
+            TimeSpan.FromSeconds(5), FastPoll, CancellationToken.None);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(ready, Is.True);
+            Assert.That(srv.Dedicated, Is.True);
+            Assert.That(cli.Reachable, Is.False, "the client realm is never pinged");
+        });
+    }
+
     private static JsonObject ServerPing(string map, bool pending) => new()
     {
         ["ok"] = true,

@@ -151,12 +151,19 @@ public sealed class ChangeLevelTool : IHostTool
                 ["bootstrap_pending"] = server.BootstrapPending,
                 ["bootstrap_error"] = server.BootstrapError,
             },
-            ["client_ping"] = new JsonObject
+        };
+        if (server.Dedicated == true)
+        {
+            result["dedicated"] = true;
+        }
+        else
+        {
+            result["client_ping"] = new JsonObject
             {
                 ["reachable"] = client.Reachable,
                 ["enabled"] = client.Enabled,
-            },
-        };
+            };
+        }
 
         if (!ready)
         {

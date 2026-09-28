@@ -52,22 +52,22 @@ local ROW_FIELDS = {
     movetype = function(e) return MCP.util.DecodeEnum("MOVETYPE_", e:GetMoveType()) end,
 }
 
--- The listen/SP host: LocalPlayer on the client, the IsListenServerHost player on
--- the server. Used as the default sort centre so a plain scan returns nearest-to-you.
-local function hostPlayer()
+-- The default sort centre, so a plain scan returns nearest-to-you: LocalPlayer on the
+-- client, and on the server MCP.player.Default (the host, or a dedicated server's only human).
+---@return Player?
+---@return string source
+local function defaultPlayer()
     if CLIENT then
         local lp = LocalPlayer()
-        return IsValid(lp) and lp or nil
+        return IsValid(lp) and lp or nil, "host"
     end
-    for _, p in ipairs(player.GetAll()) do
-        if p:IsListenServerHost() then return p end
-    end
-    return nil
+    local ply, _, isHost = MCP.player.Default()
+    return ply, isHost and "host" or "player"
 end
 
 MCP:AddFunction({
     id = "entity_find",
-    description = "Find entities and return compact rows -- index, class, model, pos and distance -- instead of a raw dump. Filter by class (wildcard ok, e.g. prop_*), model substring, a sphere (radius around an entity/point), an axis-aligned box, or all entities; filters combine (AND). Results are sorted nearest-first (to the given centre, or the host player when none is given) and capped (default 25, max 200), with total_matched and capped reported -- so a broad query can't blow the token budget. Drill into any returned index with entity_state, or enrich the rows in one pass with include_fields (angles/velocity/color/health/name/parent/etc.) and include_bounds instead of an entity_state per row. Realm-aware: the client realm only sees entities currently in its PVS (dormant or parked entities won't appear), so _sv and _cl results can differ. Runs in both realms.",
+    description = "Find entities and return compact rows -- index, class, model, pos and distance -- instead of a raw dump. Filter by class (wildcard ok, e.g. prop_*), model substring, a sphere (radius around an entity/point), an axis-aligned box, or all entities; filters combine (AND). Results are sorted nearest-first (to the given centre; otherwise the host player, or on a dedicated server the only human connected) and capped (default 25, max 200), with total_matched and capped reported -- so a broad query can't blow the token budget. Drill into any returned index with entity_state, or enrich the rows in one pass with include_fields (angles/velocity/color/health/name/parent/etc.) and include_bounds instead of an entity_state per row. Realm-aware: the client realm only sees entities currently in its PVS (dormant or parked entities won't appear), so _sv and _cl results can differ. Runs in both realms.",
     schema = {
         type = "object",
         properties = {
@@ -83,6 +83,10 @@ MCP:AddFunction({
                 type = "integer",
                 description = "Entity index to centre the search/sort on (uses that entity's position).",
             },
+            around_player = {
+                type = "string",
+                description = "Centre on a player instead: a name (case-insensitive substring), userid or SteamID. The way to pick a centre on a dedicated server, which has no host player.",
+            },
             point = {
                 type = "array",
                 items = { type = "number" },
@@ -91,7 +95,7 @@ MCP:AddFunction({
             },
             radius = {
                 type = "number",
-                description = "With a centre (`around`/`point`, or the host player), restrict matches to this sphere. Required to do a sphere search.",
+                description = "With a centre (`around`/`around_player`/`point`, or the default player), restrict matches to this sphere. Required to do a sphere search.",
             },
             box = {
                 type = "object",
@@ -158,6 +162,20 @@ MCP:AddFunction({
                 return { ok = false, error = "`around`: entity " .. tostring(args.around) .. " is not valid" }
             end
             center, centerSource = e:GetPos(), "around"
+        elseif args.around_player ~= nil then
+            local want = tostring(args.around_player)
+            -- A SteamID64 is all digits too, so only a short number is a userid.
+            local sel
+            if string.find(want, "^STEAM_") or string.find(want, "^%d%d%d%d%d%d%d%d%d%d+$") then
+                sel = { steamid = want }
+            elseif tonumber(want) then
+                sel = { userid = tonumber(want) }
+            else
+                sel = { name = want }
+            end
+            local list, perr = MCP.player.Resolve(sel)
+            if not list then return { ok = false, error = "`around_player`: " .. perr } end
+            center, centerSource = list[1]:GetPos(), "around_player"
         elseif args.point ~= nil then
             local v = vec3(args.point)
             if not v then return { ok = false, error = "`point` must be [x,y,z]" } end
@@ -174,11 +192,11 @@ MCP:AddFunction({
             if not center then center, centerSource = (mn + mx) / 2, "box" end
         elseif radius then
             if not center then
-                local h = hostPlayer()
+                local h, source = defaultPlayer()
                 if not IsValid(h) then
-                    return { ok = false, error = "`radius` needs a centre: pass around/point, or have a listen host" }
+                    return { ok = false, error = "`radius` needs a centre: pass around, around_player or point (there is no host player to default to)" }
                 end
-                center, centerSource = h:GetPos(), "host"
+                center, centerSource = h:GetPos(), source
             end
             baseSet = ents.FindInSphere(center, radius)
         elseif class then
@@ -187,10 +205,10 @@ MCP:AddFunction({
             baseSet = ents.GetAll()
         end
 
-        -- Default the sort centre to the host player when nothing spatial was given.
+        -- Default the sort centre to the default player when nothing spatial was given.
         if not center then
-            local h = hostPlayer()
-            if IsValid(h) then center, centerSource = h:GetPos(), "host" end
+            local h, source = defaultPlayer()
+            if IsValid(h) then center, centerSource = h:GetPos(), source end
         end
 
         local classMatch = class and classMatcher(class) or nil

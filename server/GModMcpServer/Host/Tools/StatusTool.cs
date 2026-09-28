@@ -11,13 +11,15 @@ public sealed class StatusTool : IHostTool
     private readonly ManifestWatcher _manifest;
     private readonly BridgePinger _pinger;
     private readonly EngineLog _engineLog;
+    private readonly DedicatedServer _dedicated;
 
-    public StatusTool(GameProcessManager proc, ManifestWatcher manifest, BridgePinger pinger, EngineLog engineLog)
+    public StatusTool(GameProcessManager proc, ManifestWatcher manifest, BridgePinger pinger, EngineLog engineLog, DedicatedServer dedicated)
     {
         _proc = proc;
         _manifest = manifest;
         _pinger = pinger;
         _engineLog = engineLog;
+        _dedicated = dedicated;
     }
 
     public string Name => "host_status";
@@ -25,7 +27,9 @@ public sealed class StatusTool : IHostTool
     public string Description =>
         "Report whether GMod is running, whether the MCP bridge is reachable (a live ping is " +
         "sent when GMod is detected), and the current tool count and capability state. " +
-        "Useful for diagnosing why a tool call isn't working.";
+        "Useful for diagnosing why a tool call isn't working. With a dedicated server configured " +
+        "(--server-start/--server-stop/--rcon) it always pings, since srcds isn't a local gmod.exe, and " +
+        "reports that configuration under `dedicated_control`.";
 
     public JsonElement InputSchema { get; } = HostToolHelpers.ParseSchema("""
     { "type": "object", "properties": {}, "required": [] }
@@ -42,7 +46,8 @@ public sealed class StatusTool : IHostTool
         };
 
         BridgePingResult? ping = null;
-        if (snap.Running)
+        // A dedicated server runs as srcds, not gmod.exe, so the process check can't gate the ping.
+        if (snap.Running || _dedicated.Configured)
         {
             var p = await _pinger.PingAsync(ct).ConfigureAwait(false);
             ping = p;
@@ -54,9 +59,14 @@ public sealed class StatusTool : IHostTool
             bridgeNode["singleplayer"] = p.SinglePlayer;
             bridgeNode["bootstrap_pending"] = p.BootstrapPending;
             bridgeNode["bootstrap_error"] = p.BootstrapError;
+            bridgeNode["dedicated"] = p.Dedicated;
             if (p.BootstrapError != null)
             {
                 bridgeNode["hint"] = p.BootstrapError;
+            }
+            else if (!p.Reachable && !snap.Running)
+            {
+                bridgeNode["hint"] = "The dedicated server's bridge didn't respond: the server may be stopped (host_launch starts it), still loading, or have mcp_enable 0 (host_rcon can set it).";
             }
             else if (!p.Reachable)
             {
@@ -115,7 +125,11 @@ public sealed class StatusTool : IHostTool
         var recentlyWritten = lastWrite is { } t && (DateTime.UtcNow - t).TotalSeconds < 30;
 
         string engineNote;
-        if (!snap.Running)
+        if (!snap.Running && _dedicated.Configured)
+            engineNote = recentlyWritten
+                ? "Dedicated server: console.log is being written, so -condebug is on and engine_log / the events stream work."
+                : "Dedicated server: console.log isn't being written. Add -condebug to the srcds command line for engine_log and the events stream.";
+        else if (!snap.Running)
             engineNote = "GMod isn't running.";
         else if (condebug == true)
             engineNote = "-condebug is on: engine output is captured to console.log — read it with engine_log; serious warnings also ride engine_events.";
@@ -131,7 +145,7 @@ public sealed class StatusTool : IHostTool
         var engineNode = new JsonObject
         {
             ["condebug"] = condebug,
-            ["capturing"] = snap.Running ? (condebug ?? recentlyWritten) : (bool?)null,
+            ["capturing"] = snap.Running ? (condebug ?? recentlyWritten) : _dedicated.Configured ? recentlyWritten : (bool?)null,
             ["present"] = _engineLog.Present,
             ["path"] = _engineLog.Path,
             ["recently_written"] = recentlyWritten,
@@ -152,6 +166,15 @@ public sealed class StatusTool : IHostTool
             ["bridge"] = bridgeNode,
             ["engine_log"] = engineNode,
         };
+        if (_dedicated.Configured)
+        {
+            result["dedicated_control"] = new JsonObject
+            {
+                ["start_command"] = _dedicated.StartCommand,
+                ["stop_command"] = _dedicated.StopCommand,
+                ["rcon"] = _dedicated.Rcon?.Endpoint,
+            };
+        }
 
         return HostToolHelpers.Ok(result.ToJsonString());
     }

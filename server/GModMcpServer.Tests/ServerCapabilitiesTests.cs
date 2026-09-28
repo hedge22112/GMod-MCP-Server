@@ -23,4 +23,21 @@ public class ServerCapabilitiesTests
             "Server must advertise tools.listChanged so clients honour the " +
             "notifications/tools/list_changed emitted on manifest changes.");
     }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void Instructions_MentionDedicatedControl_OnlyWhenConfigured(bool configured)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton(configured
+            ? new GModMcpServer.Host.DedicatedServer("systemctl start gmod", null, null)
+            : new GModMcpServer.Host.DedicatedServer(null, null, null));
+        Program.AddGModMcpServer(services);
+
+        using var provider = services.BuildServiceProvider();
+        var options = provider.GetRequiredService<IOptions<McpServerOptions>>().Value;
+
+        Assert.That(options.ServerInstructions, configured ? Does.Contain("host_rcon") : Does.Not.Contain("host_rcon"));
+    }
 }

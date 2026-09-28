@@ -71,7 +71,11 @@ public sealed class ReloadTool : IHostTool
         {
             return Err("Bridge reachable but mcp_enable is 0. Run `mcp_enable 1` in the GMod console.");
         }
-        var preClient = await _pinger.PingAsync("client", PingTimeout, ct).ConfigureAwait(false);
+        // A dedicated server has no client realm on this side of the bridge.
+        var needClient = preServer.Dedicated != true;
+        var preClient = needClient
+            ? await _pinger.PingAsync("client", PingTimeout, ct).ConfigureAwait(false)
+            : default;
 
         var serverGen0 = preServer.Generation ?? 0;
         var clientGen0 = preClient.Generation ?? 0;
@@ -111,10 +115,11 @@ public sealed class ReloadTool : IHostTool
         {
             ct.ThrowIfCancellationRequested();
             server = await _pinger.PingAsync("server", PingTimeout, ct).ConfigureAwait(false);
-            client = await _pinger.PingAsync("client", PingTimeout, ct).ConfigureAwait(false);
+            if (needClient) client = await _pinger.PingAsync("client", PingTimeout, ct).ConfigureAwait(false);
 
             var serverDone = server.Reachable && server.Enabled == true && (server.Generation ?? 0) > serverGen0;
-            var clientDone = client.Reachable && client.Enabled == true && (client.Generation ?? 0) > clientGen0;
+            var clientDone = !needClient
+                || (client.Reachable && client.Enabled == true && (client.Generation ?? 0) > clientGen0);
             if (serverDone && clientDone)
             {
                 reloaded = true;

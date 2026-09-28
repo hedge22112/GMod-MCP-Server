@@ -17,13 +17,15 @@ public sealed class LaunchTool : IHostTool
     private readonly BridgePinger _pinger;
     private readonly EngineLog _engineLog;
     private readonly string _mcpRoot;
+    private readonly DedicatedServer _dedicated;
 
-    public LaunchTool(GameProcessManager proc, BridgePinger pinger, EngineLog engineLog, BridgePaths paths)
+    public LaunchTool(GameProcessManager proc, BridgePinger pinger, EngineLog engineLog, BridgePaths paths, DedicatedServer dedicated)
     {
         _proc = proc;
         _pinger = pinger;
         _engineLog = engineLog;
         _mcpRoot = paths.McpRoot;
+        _dedicated = dedicated;
     }
 
     public string Name => "host_launch";
@@ -39,7 +41,10 @@ public sealed class LaunchTool : IHostTool
         "succeeds on gm_construct and reports map_not_found. " +
         "Tool-dispatch convars (mcp_enable, mcp_allow_*) are FCVAR_ARCHIVE so once set they persist " +
         "across game restarts — no per-launch user step. If a convar isn't set yet, the tool times " +
-        "out with a hint naming the missing convar; otherwise it returns ready with no user input.";
+        "out with a hint naming the missing convar; otherwise it returns ready with no user input. " +
+        "When the MCP server was started with --server-start (a dedicated server next to it), this runs that " +
+        "command instead, filling {map}/{gamemode}/{maxplayers} from the arguments, and waits for the server's " +
+        "bridge; the client-only arguments are ignored.";
 
     public JsonElement InputSchema { get; } = HostToolHelpers.ParseSchema("""
     {
@@ -64,6 +69,11 @@ public sealed class LaunchTool : IHostTool
 
     public async ValueTask<CallToolResult> InvokeAsync(IDictionary<string, JsonElement>? args, CancellationToken ct)
     {
+        if (_dedicated.StartCommand is { } startCommand)
+        {
+            return await LaunchDedicatedAsync(startCommand, args, ct).ConfigureAwait(false);
+        }
+
         var map = HostToolHelpers.GetString(args, "map", "gm_construct");
         var gamemode = HostToolHelpers.GetString(args, "gamemode", "sandbox");
         var console = HostToolHelpers.GetBool(args, "console", true);
@@ -297,6 +307,90 @@ public sealed class LaunchTool : IHostTool
         return HostToolHelpers.Ok(result.ToJsonString());
     }
 
+    /// <summary>
+    /// Start a dedicated server with the operator's --server-start command, then wait for its
+    /// bridge. The command must return once the server is starting (systemctl, screen -dm, tmux
+    /// new -d, nohup ... &amp;); only the server realm is waited for, since a dedicated server has
+    /// no client realm.
+    /// </summary>
+    private async Task<CallToolResult> LaunchDedicatedAsync(string startCommand, IDictionary<string, JsonElement>? args, CancellationToken ct)
+    {
+        var waitForBridge = HostToolHelpers.GetBool(args, "wait_for_bridge", true);
+        var waitTimeout = HostToolHelpers.GetInt(args, "wait_timeout_seconds", 180);
+
+        var already = await _pinger.PingAsync("server", TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+        if (already.Reachable)
+        {
+            return HostToolHelpers.Ok(new JsonObject
+            {
+                ["ok"] = true,
+                ["already_running"] = true,
+                ["map"] = already.Map,
+                ["note"] = "The server's bridge is already answering, so the start command was not run. Use host_close first to restart it.",
+            }.ToJsonString());
+        }
+
+        string command;
+        try
+        {
+            command = DedicatedServer.Expand(startCommand, new Dictionary<string, string?>
+            {
+                ["map"] = HostToolHelpers.GetString(args, "map", "gm_construct"),
+                ["gamemode"] = HostToolHelpers.GetString(args, "gamemode", "sandbox"),
+                ["maxplayers"] = (HostToolHelpers.GetIntOrNull(args, "maxplayers") ?? 16).ToString(),
+            });
+        }
+        catch (ArgumentException ex)
+        {
+            return HostToolHelpers.Err(new JsonObject { ["ok"] = false, ["error"] = ex.Message }.ToJsonString());
+        }
+
+        _engineLog.Anchor();
+        var run = await DedicatedServer.RunAsync(command, TimeSpan.FromSeconds(60), ct).ConfigureAwait(false);
+        var result = new JsonObject
+        {
+            ["ok"] = run.Succeeded,
+            ["dedicated"] = true,
+            ["command"] = command,
+            ["exit_code"] = run.ExitCode,
+            ["output"] = run.Output.Length == 0 ? null : run.Output,
+        };
+        if (!run.Succeeded)
+        {
+            result["error"] = run.TimedOut
+                ? "The start command didn't return within 60s. It has to leave the server running in the background (systemctl, screen -dm, tmux new -d, nohup ... &)."
+                : $"The start command exited with code {run.ExitCode}.";
+            return HostToolHelpers.Err(result.ToJsonString());
+        }
+        if (!waitForBridge)
+        {
+            result["bridge_ready"] = false;
+            result["note"] = "wait_for_bridge=false: returning immediately. Use host_status to check when the bridge is ready.";
+            return HostToolHelpers.Ok(result.ToJsonString());
+        }
+
+        var timeout = TimeSpan.FromSeconds(waitTimeout);
+        var (ready, server, client, elapsed) = await _pinger.WaitUntilReadyAsync(timeout, PollInterval, ct).ConfigureAwait(false);
+        result["ok"] = ready;
+        result["bridge_ready"] = ready;
+        result["wait_seconds"] = Math.Round(elapsed.TotalSeconds, 2);
+        result["last_ping"] = new JsonObject
+        {
+            ["reachable"] = server.Reachable,
+            ["enabled"] = server.Enabled,
+            ["map"] = server.Map,
+            ["maxplayers"] = server.MaxPlayers,
+            ["dedicated"] = server.Dedicated,
+        };
+        if (!ready)
+        {
+            result["error"] = ReadinessHint(server, client, timeout);
+            return HostToolHelpers.Err(result.ToJsonString());
+        }
+        HostToolHelpers.AttachBootScan(result, _engineLog.ScanBoot(), "launch");
+        return HostToolHelpers.Ok(result.ToJsonString());
+    }
+
     private static string ReadinessHint(BridgePingResult server, BridgePingResult client, TimeSpan timeout)
     {
         if (server.BootstrapError != null)
@@ -318,7 +412,7 @@ public sealed class LaunchTool : IHostTool
             return $"Timed out after {timeout.TotalSeconds:F0}s; bridge reachable but mcp_enable is still 0. "
                 + "Run `mcp_enable 1` in the GMod developer console to allow tool dispatch.";
         }
-        if (!client.Reachable || client.Enabled != true)
+        if (server.Dedicated != true && (!client.Reachable || client.Enabled != true))
         {
             return $"Timed out after {timeout.TotalSeconds:F0}s; the server realm is ready but the client realm "
                 + "didn't become ready (its bridge may still be initialising).";

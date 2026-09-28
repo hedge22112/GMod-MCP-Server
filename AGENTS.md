@@ -117,6 +117,14 @@ Editing an existing Lua tool file is enough — no console command needed. GMod'
 
 ConVar values (capability gates, `mcp_enable`) are `FCVAR_ARCHIVE` so they persist across reloads. Persisting across a game *restart* additionally needs a clean shutdown: GMod writes its archived server convars to `cfg/server.vdf` only on a proper window-close, so `host_close` does that by default (see Process tracking) — a force-kill loses any grants set that session.
 
+## Dedicated servers
+
+A dedicated server has no host player and no client realm. The server `_ping` reports `dedicated`, and the readiness waits (`WaitUntilReadyAsync`, `mcp_reload`) then stop pinging the client, which would otherwise always time out. The `level_change.json` marker is honoured on dedicated servers too, since only `_changelevel` ever writes it there.
+
+- **No-host default.** `MCP.player.Default` (`sh_player.lua`) is the "you" for a tool called with no subject: the listen host, else the only human connected, else an error listing who is. Use it rather than looking for `IsListenServerHost()` yourself.
+- **Remote-client reads.** `player_client_read_sv` runs a whitelisted client-realm **read** tool (`MCP.clientread.READ_TOOLS`) on a chosen player's client. The request names a tool and JSON args, never code, so it stays inside the cross-realm rule. The client runs its own registered handler after `MCP:CheckCapabilities`. The target must opt in with the client convar `mcp_client_share` (userinfo, so the server can fail fast). The client's own check is the one that counts. Replies are chunked (`sh_clientread_net.lua`, one net message per frame) because a screenshot outgrows one message. Don't add a mutating or code-running tool to the whitelist.
+- **Lifecycle.** `DedicatedServer` (`Host/DedicatedServer.cs`) holds `--server-start` / `--server-stop` / `--rcon`. When set, `host_launch` / `host_close` run the shell commands, or `quit` over `RconClient` when there's no stop command, instead of driving `gmod.exe`. The shell output goes to a temp file, not a pipe, so a command that leaves srcds running in the background still returns. `{map}`-style placeholders only accept map-name characters, since they land in a shell line. `host_rcon` isn't capability-gated: whoever holds the RCON password already has the server console. The dedicated sentence in the server instructions is added only when this is configured.
+
 ## Multi-host file IPC
 
 Multiple .NET MCP hosts can share the same GMod data dir (e.g. Claude Code + MCP Inspector running side-by-side). Each .NET host generates a per-process session GUID at startup and prefixes every request id with `<session>__`, so the response files are filtered by glob and never poach each other. GMod treats the prefixed id as opaque and echoes it back in the response filename. Cleanup of `mcp/<realm>/in,out/` happens in `MCP:StartBridge` (init + `mcp_reload`), so crashed-host orphans are reaped on next reload — no TTL janitor needed.
